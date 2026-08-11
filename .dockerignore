@@ -1,0 +1,16 @@
+**/.git
+**/.gitignore
+**/.vs
+**/.vscode
+**/bin
+**/obj
+**/*.user
+**/*.suo
+**/node_modules
+**/Thumbs.db
+**/.DS_Store
+**/publish
+docs/
+deployment/
+README.md
+*.md

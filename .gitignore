@@ -1,0 +1,19 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+publish/
+
+## Docker
+.env
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Secrets — never commit
+appsettings.Production.json
+*.pfx
+*.p12

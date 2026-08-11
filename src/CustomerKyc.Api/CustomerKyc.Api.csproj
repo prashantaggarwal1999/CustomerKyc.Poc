@@ -1,0 +1,74 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>CustomerKyc.Api</RootNamespace>
+    <AssemblyName>CustomerKyc.Api</AssemblyName>
+    <!-- Linux-first: no Windows-specific target framework -->
+  </PropertyGroup>
+
+  <!--
+    ══════════════════════════════════════════════════════════════════════
+    NuGet packages — versions pinned as specified in POC requirements.
+    If a package is incompatible with net10.0, it is documented in
+    docs/TDESEncrypt-Linux-Compatibility.md and the README.
+    ══════════════════════════════════════════════════════════════════════
+  -->
+  <ItemGroup>
+    <!-- Rate limiting — works with Minimal APIs via IMiddleware -->
+    <PackageReference Include="AspNetCoreRateLimit" Version="5.0.0" />
+
+    <!-- Object mapping -->
+    <PackageReference Include="AutoMapper" Version="16.1.1" />
+
+    <!-- Micro-ORM for SQL Server -->
+    <PackageReference Include="Dapper" Version="2.1.79" />
+
+    <!-- Request validation -->
+    <PackageReference Include="FluentValidation" Version="12.1.1" />
+    <PackageReference Include="FluentValidation.DependencyInjectionExtensions" Version="12.1.1" />
+
+    <!-- JWT Bearer authentication (.NET 10 package) -->
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.8" />
+
+    <!-- SQL Server ADO.NET driver — Linux-compatible (uses TDS protocol) -->
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.1" />
+
+    <!--
+      Swagger/OpenAPI: replaced with .NET 10 built-in OpenAPI document generation
+      (Microsoft.AspNetCore.OpenApi — part of the shared framework, no package needed)
+      + Scalar.AspNetCore for the browser UI.
+
+      Swashbuckle.AspNetCore 10.x was removed because it pulls in Microsoft.OpenApi 2.x
+      which renamed the Microsoft.OpenApi.Models namespace, breaking the build.
+      The built-in .NET 10 approach is the recommended path for new projects.
+      See docs/TDESEncrypt-Linux-Compatibility.md compatibility matrix for details.
+    -->
+    <!-- Built-in .NET 10 OpenAPI document generation -->
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.8" />
+
+    <!-- Scalar browser UI — replaces Swagger UI -->
+    <PackageReference Include="Scalar.AspNetCore" Version="2.6.0" />
+
+    <!-- Legacy configuration compatibility check — managed, Linux-compatible -->
+    <PackageReference Include="System.Configuration.ConfigurationManager" Version="10.0.8" />
+
+    <!-- JWT token creation/validation -->
+    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.18.0" />
+  </ItemGroup>
+
+  <!-- Reference the TDESEncrypt DLL as a project reference (source available) -->
+  <ItemGroup>
+    <ProjectReference Include="..\TDESEncrypt\TDESEncrypt.csproj" />
+  </ItemGroup>
+
+  <!-- Copy app.config for System.Configuration.ConfigurationManager POC check -->
+  <ItemGroup>
+    <None Update="app.config">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

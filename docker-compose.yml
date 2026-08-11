@@ -1,0 +1,87 @@
+version: "3.9"
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Customer KYC POC — Docker Compose environment
+#
+#  Services:
+#    customer-kyc-api  — .NET 10 Minimal API (Linux container)
+#    sqlserver         — SQL Server 2022 (Linux container)
+#
+#  Configuration is supplied entirely via environment variables so the same
+#  image can be promoted through dev → test → production without rebuilding.
+# ════════════════════════════════════════════════════════════════════════════
+
+services:
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: customer-kyc-sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "YourStrong@Password123"
+      MSSQL_PID: "Developer"
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'YourStrong@Password123' -C -Q 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Init container: runs schema.sql once SQL Server is healthy
+  sqlserver-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: customer-kyc-sqlserver-init
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    entrypoint: >
+      bash -c "
+        /opt/mssql-tools18/bin/sqlcmd -S sqlserver -U sa -P 'YourStrong@Password123' -C
+          -i /schema.sql &&
+        echo 'Schema initialised.'
+      "
+    volumes:
+      - ./database/schema.sql:/schema.sql:ro
+    restart: "no"
+
+  customer-kyc-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: customer-kyc-poc:latest
+    container_name: customer-kyc-api
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    ports:
+      - "5000:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Production"
+      ASPNETCORE_URLS: "http://+:8080"
+      # Override appsettings.json via environment variables
+      ConnectionStrings__DefaultConnection: >-
+        Server=sqlserver;Database=CustomerKycDb;
+        User Id=sa;Password=YourStrong@Password123;
+        TrustServerCertificate=true;Encrypt=false
+      Jwt__Issuer: "CustomerKycApi"
+      Jwt__Audience: "CustomerKycApiUsers"
+      Jwt__Secret: "docker-compose-secret-min-32-chars-long!!"
+      Encryption__Key: "docker-compose-encryption-key-32chars!!"
+      Auth__Username: "poc-user"
+      Auth__Password: "poc-password"
+      DOTNET_RUNNING_IN_CONTAINER: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  sqlserver-data:

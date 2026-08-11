@@ -1,0 +1,62 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  systemd service unit — Customer KYC API
+#
+#  Deployment path: /etc/systemd/system/customer-kyc-api.service
+#  Application path: /opt/customer-kyc-api/
+#
+#  This demonstrates the AWX → Linux direct deployment model (no Docker).
+#  The application is published with:
+#    dotnet publish -c Release -r linux-x64 --self-contained false
+#  and copied to /opt/customer-kyc-api/.
+#
+#  Steps:
+#    sudo cp customer-kyc-api.service /etc/systemd/system/
+#    sudo systemctl daemon-reload
+#    sudo systemctl enable customer-kyc-api
+#    sudo systemctl start customer-kyc-api
+#    sudo systemctl status customer-kyc-api
+#    sudo journalctl -u customer-kyc-api -f
+# ════════════════════════════════════════════════════════════════════════════
+
+[Unit]
+Description=Customer KYC API (.NET 10 Minimal API)
+Documentation=https://internal-wiki/customer-kyc-api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dotnet-apps
+Group=dotnet-apps
+WorkingDirectory=/opt/customer-kyc-api
+
+# dotnet must be on PATH for the target user, or use full path: /usr/bin/dotnet
+ExecStart=/usr/bin/dotnet /opt/customer-kyc-api/CustomerKyc.Api.dll
+
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Environment — secrets should come from a managed secrets store in production.
+# For the POC, use an EnvironmentFile or inline values.
+Environment=ASPNETCORE_ENVIRONMENT=Production
+Environment=ASPNETCORE_URLS=http://0.0.0.0:5000
+Environment=DOTNET_RUNNING_IN_CONTAINER=false
+
+# Uncomment and populate before going live:
+# EnvironmentFile=/opt/customer-kyc-api/.env
+
+# Logging — output goes to journald (use: journalctl -u customer-kyc-api)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=customer-kyc-api
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/customer-kyc-api/logs
+
+[Install]
+WantedBy=multi-user.target

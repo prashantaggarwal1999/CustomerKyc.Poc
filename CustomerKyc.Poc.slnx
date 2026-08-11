@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CustomerKyc.Api/CustomerKyc.Api.csproj" />
+    <Project Path="src/TDESEncrypt/TDESEncrypt.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CustomerKyc.Api.Tests/CustomerKyc.Api.Tests.csproj" />
+  </Folder>
+</Solution>
