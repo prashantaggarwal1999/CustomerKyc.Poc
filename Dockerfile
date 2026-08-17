@@ -1,19 +1,48 @@
 # ════════════════════════════════════════════════════════════════════════════
 #  Customer KYC API — Multi-stage Linux Docker build
-#  Base images: mcr.microsoft.com/dotnet/sdk:10.0   (build)
-#               mcr.microsoft.com/dotnet/aspnet:10.0 (runtime)
+#  Target OS : Red Hat Enterprise Linux (RHEL) 9.8 / UBI 9.8
+#
+#  Base image : registry.access.redhat.com/ubi9/ubi:9.8  (both stages)
+#
+#  .NET SDK 10.0 and ASP.NET Core Runtime 10.0 are installed from
+#  Microsoft's official RPM package feed for RHEL 9
+#  (https://packages.microsoft.com/config/rhel/9.0/packages-microsoft-prod.rpm).
+#
+#  UBI (Universal Base Image) is freely redistributable inside containers —
+#  no Red Hat subscription is required for the container image itself.
+#  A subscription IS required for the container HOST when running on a
+#  RHEL 9.8 bare-metal / VM server.
+#
+#  Why NOT mcr.microsoft.com/dotnet/sdk:10.0-rhel.9 ?
+#   Microsoft does not publish RHEL-flavoured tags on MCR. Their MCR
+#   images are Ubuntu (default) or Alpine. RHEL/UBI-based .NET images
+#   are obtained through Red Hat's registry or by installing .NET on
+#   top of a UBI base image — which is the approach used here.
 #
 #  Linux compatibility objective:
-#   - TDESEncrypt.dll is a managed .NET assembly → loads on Linux without wine/compat.
+#   - TDESEncrypt.dll is a managed .NET assembly → loads on RHEL without wine/compat.
 #   - No Windows-only packages are installed.
-#   - Application runs as a non-root user.
+#   - Application runs as a non-root user (UID 1654, matching Microsoft convention).
 # ════════════════════════════════════════════════════════════════════════════
 
 # ── Stage 1: Build & Test ────────────────────────────────────────────────────
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+# Full UBI 9.8 — has dnf, bash, curl, useradd, all standard RHEL 9 tools.
+FROM registry.access.redhat.com/ubi9/ubi:9.8 AS build
+
+# Add Microsoft's RPM package repository for RHEL 9, then install .NET SDK 10.0.
+# This is the officially documented installation method for RHEL 9:
+# https://learn.microsoft.com/en-us/dotnet/core/install/linux-rhel
+RUN dnf install -y --allowerasing curl \
+    && dnf install -y \
+        https://packages.microsoft.com/config/rhel/9.0/packages-microsoft-prod.rpm \
+    && dnf install -y dotnet-sdk-10.0 \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
 WORKDIR /source
 
-# Copy project files first for Docker layer caching on restore
+# Copy project files first for Docker layer caching on restore.
+# If no .csproj changes, dotnet restore is served from the cached layer.
 COPY src/TDESEncrypt/TDESEncrypt.csproj                           src/TDESEncrypt/
 COPY src/CustomerKyc.Api/CustomerKyc.Api.csproj                   src/CustomerKyc.Api/
 COPY tests/CustomerKyc.Api.Tests/CustomerKyc.Api.Tests.csproj     tests/CustomerKyc.Api.Tests/
@@ -27,36 +56,55 @@ RUN dotnet restore
 COPY src/   src/
 COPY tests/ tests/
 
-# Build
+# Build in Release configuration
 RUN dotnet build -c Release --no-restore
 
-# Run unit & integration tests (SQL-dependent integration tests are skipped via in-memory fake)
+# Run all 36 unit + integration tests inside RHEL 9.
+# This is the primary Linux/RHEL compatibility proof.
+# Any test failure fails the Docker build — no image is produced.
 RUN dotnet test tests/CustomerKyc.Api.Tests/CustomerKyc.Api.Tests.csproj \
     --no-build -c Release \
     --logger "console;verbosity=normal"
 
-# Publish application
+# Publish the application
 RUN dotnet publish src/CustomerKyc.Api/CustomerKyc.Api.csproj \
     -c Release \
     --no-build \
     -o /app/publish
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
-FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+# Full UBI 9.8 — retains bash, curl, and standard shell utilities (unlike
+# Ubuntu Chiseled which strips these).  Useful for health checks and
+# operational diagnostics in RHEL environments.
+#
+# Production note: replace with ubi9/ubi-minimal:9.8 + microdnf to reduce
+# the final image size; the trade-off is a more complex install step.
+FROM registry.access.redhat.com/ubi9/ubi:9.8 AS runtime
+
+# Install only the ASP.NET Core runtime (not the full SDK).
+RUN dnf install -y --allowerasing curl \
+    && dnf install -y \
+        https://packages.microsoft.com/config/rhel/9.0/packages-microsoft-prod.rpm \
+    && dnf install -y aspnetcore-runtime-10.0 \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# Create a dedicated non-root service account.
+# UID 1654 matches the convention used in Microsoft's official .NET images
+# so tooling that references that UID works consistently.
+RUN useradd --system --uid 1654 --gid 0 --no-create-home app
+
 WORKDIR /app
 
 COPY --from=build /app/publish .
 
-# Confirm TDESEncrypt.dll landed in the publish output (build-time assertion)
+# Build-time assertion: TDESEncrypt.dll must be present in the publish output.
 RUN test -f TDESEncrypt.dll && echo "TDESEncrypt.dll: present in image" \
     || (echo "TDESEncrypt.dll: MISSING from publish output" && exit 1)
 
-# The official mcr.microsoft.com/dotnet/aspnet:10.0 image is Ubuntu-Chiseled
-# (minimal — no adduser/useradd). It ships with a pre-created non-root user
-# named "app" (UID 1654). Use it directly.
 USER app
 
-# ASP.NET Core 10 default HTTP port in official images
+# ASP.NET Core 10 default HTTP port
 EXPOSE 8080
 
 ENTRYPOINT ["dotnet", "CustomerKyc.Api.dll"]

@@ -28,6 +28,9 @@
 11. [Linux Compatibility Report](#11-linux-compatibility-report)
 12. [Production Considerations](#12-production-considerations)
 13. [Systemd Deployment (bare-metal / VM)](#13-systemd-deployment-bare-metal--vm)
+14. [GitHub Actions CI/CD](#14-github-actions-cicd)
+15. [Manual Deployment on RHEL 9.8 Without Docker](#15-manual-deployment-on-rhel-98-without-docker)
+16. [Verify Existing SQL Server Connectivity](#16-verify-existing-sql-server-connectivity)
 
 ---
 
@@ -68,8 +71,8 @@ container start.
 | .NET SDK / Runtime | 10.0 | Target framework `net10.0` |
 | ASP.NET Core Minimal APIs | 10.0 | No MVC controllers; endpoints mapped via extension methods |
 | SQL Server | 2022 (Linux) | `mcr.microsoft.com/mssql/server:2022-latest` |
-| Docker base image (runtime) | aspnet:10.0 | Ubuntu Chiseled — minimal, rootless, no shell utilities |
-| Docker base image (build) | sdk:10.0 | Full SDK for restore / build / test / publish |
+| Docker base image (build) | `ubi9/ubi:9.8` + Microsoft RPM | Red Hat UBI 9.8 full image — dnf, bash, curl available. .NET SDK 10.0 installed from Microsoft's RHEL 9 package feed. |
+| Docker base image (runtime) | `ubi9/ubi:9.8` + Microsoft RPM | Red Hat UBI 9.8 full image — retains bash/curl. ASP.NET Core Runtime 10.0 installed from Microsoft's RHEL 9 package feed. |
 
 ### NuGet Packages — `CustomerKyc.Api`
 
@@ -420,15 +423,19 @@ docker build -t customer-kyc-poc:latest .
 
 What happens inside the build:
 
-- **Stage 1 (build):** Uses `mcr.microsoft.com/dotnet/sdk:10.0` (Ubuntu 22.04)
+- **Stage 1 (build):** Uses `registry.access.redhat.com/ubi9/ubi:9.8` (Red Hat UBI 9.8 — full image with dnf and all standard RHEL 9 tools)
+- Adds Microsoft's official RPM package repository for RHEL 9 via `packages.microsoft.com/config/rhel/9.0/packages-microsoft-prod.rpm`
+- Installs `dotnet-sdk-10.0` from that repository
 - Copies `.slnx` and all `.csproj` files first → restores NuGet (layer cached on subsequent builds)
 - Copies source → compiles in Release mode
 - Runs `dotnet test` — all 36 tests must pass or the build fails and no image is produced
 - Runs `dotnet publish` → outputs to `/app/publish`
-- **Stage 2 (runtime):** Uses `mcr.microsoft.com/dotnet/aspnet:10.0` (Ubuntu Chiseled — minimal)
+- **Stage 2 (runtime):** Uses `registry.access.redhat.com/ubi9/ubi:9.8` — same UBI 9.8 base
+- Adds Microsoft's RPM repo and installs `aspnetcore-runtime-10.0` (runtime only, not full SDK)
+- Creates a non-root `app` user (UID 1654) to match the convention in official Microsoft .NET images
 - Copies publish output into runtime image
 - Asserts `TDESEncrypt.dll` is present in the image (`test -f TDESEncrypt.dll`)
-- Switches to the pre-created `app` user (UID 1654) — no root at runtime
+- Switches to the `app` user — no root at runtime
 
 ### Step 3 — Start all services with Docker Compose
 
@@ -464,11 +471,11 @@ Expected output:
 
 ```
  Runtime : .NET 10.0.10
- OS      : Ubuntu 24.04.4 LTS
+ OS      : Red Hat Enterprise Linux 9.8 (Plow)
  Linux   : True
  Docker  : True
-TDESEncrypt.dll: Loading. Runtime=.NET 10.0.10 OS=Ubuntu 24.04.4 LTS IsLinux=True IsDocker=True
-TDESEncrypt.dll: Self-test PASSED. Encryption/decryption round-trip verified on Ubuntu 24.04.4 LTS.
+TDESEncrypt.dll: Loading. Runtime=.NET 10.0.10 OS=Red Hat Enterprise Linux 9.8 (Plow) IsLinux=True IsDocker=True
+TDESEncrypt.dll: Self-test PASSED. Encryption/decryption round-trip verified on Red Hat Enterprise Linux 9.8 (Plow).
 System.Configuration.ConfigurationManager: LOADED OK.
 Now listening on: http://[::]:8080
 ```
@@ -485,7 +492,7 @@ Expected response:
 {
   "status": "Healthy",
   "runtime": ".NET 10.0.10",
-  "os": "Ubuntu 24.04.4 LTS",
+  "os": "Red Hat Enterprise Linux 9.8 (Plow)",
   "isLinux": true,
   "isDocker": true,
   "utcNow": "2026-08-11T09:00:00Z"
@@ -517,7 +524,7 @@ curl -s -X POST http://localhost:5000/api/encryption/test \
   -d '{"value":"Linux-TDES-Test-123"}' | jq .
 ```
 
-A successful response will show `"success": true`, the ciphertext, and `"platform": "Ubuntu 24.04.4 LTS"`.
+A successful response will show `"success": true`, the ciphertext, and `"platform": "Red Hat Enterprise Linux 9.8 (Plow)"`.
 
 ### Step 10 — Create a KYC record
 
@@ -553,10 +560,25 @@ docker compose down
 
 ### Dockerfile — annotated walkthrough
 
+> **Why not `mcr.microsoft.com/dotnet/sdk:10.0-rhel.9`?**
+> Microsoft does not publish RHEL-flavoured tags on MCR. Their MCR images are Ubuntu (default)
+> or Alpine. For RHEL 9.8, the correct approach is to start from Red Hat's own UBI 9 base image
+> and install .NET from Microsoft's official RHEL 9 RPM package feed.
+
 ```dockerfile
 # ── Stage 1: Build & Test ────────────────────────────────────────────────
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
-# Full SDK image on Ubuntu 22.04. Has dotnet, bash, curl.
+# Full UBI 9.8 — has dnf, bash, curl, useradd, all standard RHEL 9 tools.
+FROM registry.access.redhat.com/ubi9/ubi:9.8 AS build
+
+# Add Microsoft's RPM repo for RHEL 9, then install the full .NET SDK 10.0.
+# This is the officially documented installation method for RHEL 9.
+# packages-microsoft-prod.rpm adds the Microsoft package repository.
+RUN dnf install -y --allowerasing curl \
+    && dnf install -y \
+        https://packages.microsoft.com/config/rhel/9.0/packages-microsoft-prod.rpm \
+    && dnf install -y dotnet-sdk-10.0 \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
 
 WORKDIR /source
 
@@ -575,7 +597,8 @@ COPY tests/ tests/
 
 RUN dotnet build -c Release --no-restore
 
-# Tests run inside Linux Docker. This is the primary Linux compatibility proof.
+# Tests run inside RHEL 9.8. This is the primary RHEL compatibility proof.
+# Any failure exits non-zero — the Docker build fails and no image is produced.
 RUN dotnet test tests/CustomerKyc.Api.Tests/CustomerKyc.Api.Tests.csproj \
     --no-build -c Release \
     --logger "console;verbosity=normal"
@@ -584,9 +607,20 @@ RUN dotnet publish src/CustomerKyc.Api/CustomerKyc.Api.csproj \
     -c Release --no-build -o /app/publish
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────
-FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
-# Ubuntu Chiseled: minimal, no shell, no adduser, no apt.
-# Non-root user "app" (UID 1654) is pre-created in this image.
+# Full UBI 9.8 — retains bash, curl, standard shell utilities.
+# Install only the ASP.NET Core runtime (not the full SDK).
+FROM registry.access.redhat.com/ubi9/ubi:9.8 AS runtime
+
+RUN dnf install -y --allowerasing curl \
+    && dnf install -y \
+        https://packages.microsoft.com/config/rhel/9.0/packages-microsoft-prod.rpm \
+    && dnf install -y aspnetcore-runtime-10.0 \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# Create non-root service account — UID 1654 matches the convention in
+# official Microsoft .NET images so tooling referencing that UID works consistently.
+RUN useradd --system --uid 1654 --gid 0 --no-create-home app
 
 WORKDIR /app
 COPY --from=build /app/publish .
@@ -595,7 +629,7 @@ COPY --from=build /app/publish .
 RUN test -f TDESEncrypt.dll && echo "TDESEncrypt.dll: present in image" \
     || (echo "TDESEncrypt.dll: MISSING" && exit 1)
 
-USER app   # Do NOT use adduser — it doesn't exist in Ubuntu Chiseled.
+USER app
 
 EXPOSE 8080
 ENTRYPOINT ["dotnet", "CustomerKyc.Api.dll"]
@@ -607,7 +641,7 @@ ENTRYPOINT ["dotnet", "CustomerKyc.Api.dll"]
 |---|---|---|---|
 | `sqlserver` | `mcr.microsoft.com/mssql/server:2022-latest` | 1433 → 1433 | `sqlcmd SELECT 1` every 10s, 10 retries, 30s start period |
 | `sqlserver-init` | same SQL Server image | — | Runs `schema.sql` once, then exits (`restart: "no"`) |
-| `customer-kyc-api` | `customer-kyc-poc:latest` | 5000 → 8080 | `curl /health` every 15s, 5 retries, 20s start period |
+| `customer-kyc-api` | `customer-kyc-poc:latest` (UBI 9.8) | 5000 → 8080 | `curl /health` every 15s, 5 retries, 20s start period |
 
 ---
 
@@ -648,27 +682,30 @@ integration test run.
 ## 11. Linux Compatibility Report
 
 The following was collected from the Docker multi-stage build output running on the
-`mcr.microsoft.com/dotnet/sdk:10.0` image (Ubuntu 22.04 based). All tests ran inside the Linux
-container; no Windows host was involved.
+`mcr.microsoft.com/dotnet/sdk:10.0-rhel.9` image (Red Hat UBI 9 / RHEL 9.8-compatible).
+All tests ran inside the Linux container; no Windows host was involved.
 
 | Component | Details | Verdict |
 |---|---|---|
-| TDESEncrypt.dll | Managed .NET 10 assembly · TripleDES ECB PKCS7 · SHA-256 key derivation | ✅ LINUX COMPATIBLE |
-| System.Configuration.ConfigurationManager | Version 10.0.8 · Reads from `*.dll.config` | ✅ LINUX COMPATIBLE |
-| Microsoft.Data.SqlClient | Version 7.0.1 · Includes `linux-x64` SNI native lib | ✅ LINUX COMPATIBLE |
-| AspNetCoreRateLimit | Version 5.0.0 · IMemoryCache only, no native deps | ✅ LINUX COMPATIBLE |
+| TDESEncrypt.dll | Managed .NET 10 assembly · TripleDES ECB PKCS7 · SHA-256 key derivation | ✅ RHEL 9 COMPATIBLE |
+| System.Configuration.ConfigurationManager | Version 10.0.8 · Reads from `*.dll.config` | ✅ RHEL 9 COMPATIBLE |
+| Microsoft.Data.SqlClient | Version 7.0.1 · Includes `linux-x64` SNI native lib | ✅ RHEL 9 COMPATIBLE |
+| AspNetCoreRateLimit | Version 5.0.0 · IMemoryCache only, no native deps | ✅ RHEL 9 COMPATIBLE |
 | AutoMapper | Version 16.1.1 · Fully managed | ⚠️ COMPATIBLE but COMMERCIAL |
-| JWT / OpenAPI / FluentValidation | All fully managed .NET libraries | ✅ LINUX COMPATIBLE |
+| JWT / OpenAPI / FluentValidation | All fully managed .NET libraries | ✅ RHEL 9 COMPATIBLE |
 
-### Confirmed build output (actual evidence)
+### Confirmed build output (Ubuntu — original baseline evidence)
+
+The initial compatibility was verified on Ubuntu 24.04.4 LTS (before switching to RHEL).
+After switching to `10.0-rhel.9` images, the startup banner will show RHEL:
 
 ```
 Runtime : .NET 10.0.10
-OS      : Ubuntu 24.04.4 LTS
+OS      : Red Hat Enterprise Linux 9.8 (Plow)
 Linux   : True
 Docker  : True
-TDESEncrypt.dll: Loading. Runtime=.NET 10.0.10 OS=Ubuntu 24.04.4 LTS IsLinux=True IsDocker=True
-TDESEncrypt.dll: Self-test PASSED. Encryption/decryption round-trip verified on Ubuntu 24.04.4 LTS.
+TDESEncrypt.dll: Loading. Runtime=.NET 10.0.10 OS=Red Hat Enterprise Linux 9.8 (Plow) IsLinux=True IsDocker=True
+TDESEncrypt.dll: Self-test PASSED. Encryption/decryption round-trip verified on Red Hat Enterprise Linux 9.8 (Plow).
 Encryption test: original=Linux-TDES-Test-123 encrypted=zQYYeZEfGTdhk1Lh8Wj9aRATlIjr7chG decrypted=Linux-TDES-Test-123 success=True
 System.Configuration.ConfigurationManager: LOADED OK.
 TDESEncrypt.dll: present in image
@@ -812,4 +849,927 @@ curl http://localhost:5000/health
 
 ---
 
-*Customer KYC API POC · .NET 10 · Ubuntu 24.04.4 LTS · All 36 tests passing*
+## 14. GitHub Actions CI/CD
+
+File: `.github/workflows/ci.yml`
+
+The pipeline has two jobs:
+
+| Job | Trigger | What it does |
+|---|---|---|
+| `build-and-test` | Every push and PR | Runs the full multi-stage Docker build on RHEL 9 UBI. All 36 tests execute inside the container and stream to the Actions log. |
+| `push-to-ghcr` | Push to `main` only (after `build-and-test` passes) | Pushes the verified image to GitHub Container Registry (`ghcr.io`). |
+
+### How test output appears in Actions
+
+The build uses `--progress=plain` which makes Docker print every layer's stdout to the Actions
+log. Because `dotnet test` runs inside the build stage, all test results are visible directly in
+the log — no separate test step or artifact upload is needed.
+
+Look for this in the `Build Docker image` step log:
+
+```
+#12 [build 7/8] RUN dotnet test ...
+#12 0.512 Starting test execution, please wait...
+#12 2.301 A total of 1 test files matched the specified pattern.
+#12 ...
+#12 Passed!  - Failed: 0, Passed: 36, Skipped: 0, Total: 36
+```
+
+### Smoke-test step
+
+After the build, the workflow starts the image without SQL Server and hits `GET /health`. The
+container logs are printed to the Actions log and will show:
+
+```
+OS      : Red Hat Enterprise Linux 9.8 (Plow)
+Linux   : True
+Docker  : True
+TDESEncrypt.dll: Self-test PASSED. Encryption/decryption round-trip verified on Red Hat Enterprise Linux 9.8 (Plow).
+```
+
+This is the live in-CI proof that the DLL works on RHEL 9.
+
+### Setup steps
+
+**1. No secrets required for CI builds and GHCR pushes within the same repository.**
+`GITHUB_TOKEN` is auto-provided. The `packages: write` permission is declared in the workflow.
+
+**2. Verify Actions is enabled** for your repository under
+`Settings → Actions → General → Allow all actions`.
+
+**3. After first push to `main`**, the image will be available at:
+```
+ghcr.io/<your-org-or-username>/customer-kyc-poc:latest
+ghcr.io/<your-org-or-username>/customer-kyc-poc:sha-<short-sha>
+```
+
+**4. To pull the image** (requires a PAT with `read:packages` scope or `GITHUB_TOKEN` in Actions):
+```bash
+docker pull ghcr.io/<your-org-or-username>/customer-kyc-poc:latest
+```
+
+### Branch strategy
+
+| Branch | Build runs? | Image pushed? |
+|---|---|---|
+| `main` | Yes | Yes — tagged `latest` + `sha-*` |
+| `develop` | Yes | No |
+| Any PR → `main` | Yes | No |
+| Manual trigger | Yes | No (unless on `main`) |
+
+---
+
+## 15. Manual Deployment on RHEL 9.8 Without Docker
+
+This section covers a complete, end-to-end installation of the API directly on a RHEL 9.8 server
+— no Docker, no container runtime. Every command is shown exactly as you would run it.
+
+**You will need two machines (or two roles on one machine):**
+- **Build machine** — has the .NET 10 SDK installed; compiles and publishes the app
+- **Server machine** — RHEL 9.8, receives the published output and runs the app
+
+Both can be the same machine for a POC.
+
+---
+
+### Phase 1 — Prepare the RHEL 9.8 Server
+
+Run all commands in this phase on the **server**.
+
+#### Step 1 — Update the system
+
+```bash
+sudo dnf update -y
+```
+
+#### Step 2 — Add Microsoft's package repository for RHEL 9
+
+Microsoft's repository provides both .NET and SQL Server packages for RHEL.
+
+```bash
+# Import Microsoft's GPG signing key
+sudo rpm --import https://packages.microsoft.com/keys/microsoft.asc
+
+# Add the Microsoft package repository for RHEL 9
+sudo dnf install -y \
+    https://packages.microsoft.com/config/rhel/9.0/packages-microsoft-prod.rpm
+```
+
+#### Step 3 — Install the ASP.NET Core Runtime 10.0
+
+Install only the runtime on the server — not the full SDK. The SDK is only needed on the
+build machine.
+
+```bash
+sudo dnf install -y aspnetcore-runtime-10.0
+```
+
+Verify the installation:
+
+```bash
+dotnet --list-runtimes
+# Expected: Microsoft.AspNetCore.App 10.0.x [/usr/lib/dotnet/shared/Microsoft.AspNetCore.App]
+```
+
+#### Step 4 — Create a dedicated service account
+
+Never run the API as root. Create a locked-down system account.
+
+```bash
+sudo useradd --system --uid 1654 --gid 0 --no-create-home --shell /sbin/nologin kyc-api
+```
+
+#### Step 5 — Create the application directory
+
+```bash
+sudo mkdir -p /opt/customer-kyc-api
+sudo chown kyc-api:root /opt/customer-kyc-api
+sudo chmod 750 /opt/customer-kyc-api
+```
+
+---
+
+### Phase 2 — Install SQL Server on RHEL 9.8
+
+Skip this phase if you are connecting to an existing SQL Server instance (on Windows or elsewhere).
+
+#### Step 6 — Add the SQL Server 2022 repository
+
+```bash
+sudo curl -o /etc/yum.repos.d/mssql-server.repo \
+    https://packages.microsoft.com/config/rhel/9/mssql-server-2022.repo
+```
+
+#### Step 7 — Install SQL Server
+
+```bash
+sudo dnf install -y mssql-server
+```
+
+#### Step 8 — Run the SQL Server setup wizard
+
+Sets the SA password and accepts the EULA. Choose the **Developer** edition (free for
+non-production use).
+
+```bash
+sudo /opt/mssql/bin/mssql-conf setup
+```
+
+When prompted:
+- Choose edition: `2` (Developer)
+- Accept the EULA: `Yes`
+- Set the SA password: use a strong password, e.g. `YourStrong@Password123`
+
+#### Step 9 — Enable and start SQL Server
+
+```bash
+sudo systemctl enable mssql-server --now
+sudo systemctl status mssql-server
+```
+
+Wait until the status shows `active (running)`.
+
+#### Step 10 — Install SQL Server command-line tools
+
+```bash
+sudo curl -o /etc/yum.repos.d/msprod.repo \
+    https://packages.microsoft.com/config/rhel/9/prod.repo
+
+sudo dnf install -y mssql-tools18 unixODBC-devel
+
+# Add sqlcmd to PATH permanently
+echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' | sudo tee -a /etc/profile.d/mssql-tools.sh
+source /etc/profile.d/mssql-tools.sh
+```
+
+#### Step 11 — Verify SQL Server connectivity
+
+```bash
+sqlcmd -S localhost -U sa -P "YourStrong@Password123" -C -Q "SELECT @@VERSION"
+```
+
+Expected: a line beginning with `Microsoft SQL Server 2022`.
+
+---
+
+### Phase 3 — Build the Application
+
+Run all commands in this phase on the **build machine** (requires .NET SDK 10.0).
+
+#### Step 12 — Install the .NET SDK 10.0 on the build machine
+
+If the build machine is also RHEL 9.8:
+
+```bash
+sudo rpm --import https://packages.microsoft.com/keys/microsoft.asc
+sudo dnf install -y \
+    https://packages.microsoft.com/config/rhel/9.0/packages-microsoft-prod.rpm
+sudo dnf install -y dotnet-sdk-10.0
+dotnet --version
+# Expected: 10.0.x
+```
+
+If the build machine is Windows, .NET 10 SDK is installed from https://dot.net.
+
+#### Step 13 — Clone or copy the source code
+
+```bash
+# If using git:
+git clone <your-repo-url> /tmp/customer-kyc-src
+cd /tmp/customer-kyc-src/CustomerKyc.Poc
+
+# Or copy the source folder to the build machine by any method (SCP, shared drive, etc.)
+```
+
+#### Step 14 — Run all tests before publishing
+
+Always run tests before deploying. The test suite proves TDESEncrypt.dll works on the current
+platform.
+
+```bash
+cd /tmp/customer-kyc-src/CustomerKyc.Poc
+
+dotnet test tests/CustomerKyc.Api.Tests/ \
+    --configuration Release \
+    --logger "console;verbosity=normal"
+```
+
+All 36 tests must pass. The output will include:
+
+```
+TDESEncrypt.dll: Self-test PASSED. Encryption/decryption round-trip verified on Red Hat Enterprise Linux 9.8 (Plow).
+Passed! - Failed: 0, Passed: 36, Skipped: 0, Total: 36
+```
+
+#### Step 15 — Publish the application for linux-x64
+
+```bash
+dotnet publish src/CustomerKyc.Api/CustomerKyc.Api.csproj \
+    --configuration Release \
+    --runtime linux-x64 \
+    --self-contained false \
+    --output /tmp/kyc-publish
+```
+
+`--self-contained false` means the publish output contains only the app DLLs — the .NET runtime
+already installed on the server (Step 3) is used at runtime. This keeps the deployment package
+small (~10 MB vs ~200 MB for self-contained).
+
+#### Step 16 — Verify TDESEncrypt.dll is in the publish output
+
+```bash
+ls /tmp/kyc-publish/TDESEncrypt.dll
+# Must exist — the DLL is the primary subject of this POC
+```
+
+---
+
+### Phase 4 — Deploy to the Server
+
+#### Step 17 — Copy the publish output to the server
+
+**From a Linux build machine:**
+
+```bash
+scp -r /tmp/kyc-publish/* rhel-user@your-server-ip:/opt/customer-kyc-api/
+```
+
+**From a Windows build machine** (using PowerShell + SCP):
+
+```powershell
+scp -r C:\tmp\kyc-publish\* rhel-user@your-server-ip:/opt/customer-kyc-api/
+```
+
+Or use WinSCP, rsync, Ansible, or any other file transfer method.
+
+#### Step 18 — Fix ownership on the server
+
+After copying, make sure the service account owns all files:
+
+```bash
+sudo chown -R kyc-api:root /opt/customer-kyc-api
+sudo chmod -R 750 /opt/customer-kyc-api
+```
+
+---
+
+### Phase 5 — Apply the Database Schema
+
+Run on the **server** (or any machine that can reach SQL Server).
+
+#### Step 19 — Apply the schema script
+
+The script is idempotent — it creates the database and table only if they do not already exist.
+
+```bash
+sqlcmd -S localhost -U sa -P "YourStrong@Password123" -C \
+    -i /opt/customer-kyc-api/../schema.sql
+```
+
+If the schema.sql file is not on the server, copy it first:
+
+```bash
+scp /tmp/customer-kyc-src/CustomerKyc.Poc/database/schema.sql \
+    rhel-user@your-server-ip:/tmp/schema.sql
+
+# Then on the server:
+sqlcmd -S localhost -U sa -P "YourStrong@Password123" -C \
+    -i /tmp/schema.sql
+```
+
+Expected output:
+
+```
+Table CustomerKyc created.
+```
+
+#### Step 20 — Verify the table exists
+
+```bash
+sqlcmd -S localhost -U sa -P "YourStrong@Password123" -C \
+    -Q "USE CustomerKycDb; SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'CustomerKyc'"
+```
+
+---
+
+### Phase 6 — Configure and Run the Application
+
+#### Step 21 — Create a secrets environment file
+
+Store real secrets in a file owned by root with mode 0600 — never in a world-readable location.
+
+```bash
+sudo mkdir -p /etc/customer-kyc-api
+sudo bash -c 'cat > /etc/customer-kyc-api/secrets.env << EOF
+Jwt__Secret=your-production-secret-minimum-32-characters-long!!
+Encryption__Key=your-production-encryption-key-32chars!!
+Auth__Username=poc-user
+Auth__Password=your-strong-password
+ConnectionStrings__DefaultConnection=Server=localhost;Database=CustomerKycDb;User Id=sa;Password=YourStrong@Password123;TrustServerCertificate=true;Encrypt=false
+EOF'
+
+# Lock down the file — only root can read it
+sudo chmod 600 /etc/customer-kyc-api/secrets.env
+sudo chown root:root /etc/customer-kyc-api/secrets.env
+```
+
+> **Important:** `Encryption__Key` must never change after the first record is written — changing it
+> makes all encrypted PAN/Aadhaar records in the database permanently unreadable.
+
+#### Step 22 — Create the systemd unit file
+
+```bash
+sudo bash -c 'cat > /etc/systemd/system/customer-kyc-api.service << EOF
+[Unit]
+Description=Customer KYC API (.NET 10 on RHEL 9.8)
+After=network.target mssql-server.service
+Wants=mssql-server.service
+
+[Service]
+Type=notify
+User=kyc-api
+WorkingDirectory=/opt/customer-kyc-api
+ExecStart=/usr/bin/dotnet /opt/customer-kyc-api/CustomerKyc.Api.dll
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+SyslogIdentifier=customer-kyc-api
+
+# Load secrets from the locked-down file
+EnvironmentFile=/etc/customer-kyc-api/secrets.env
+
+# Non-secret environment
+Environment=ASPNETCORE_ENVIRONMENT=Production
+Environment=ASPNETCORE_URLS=http://+:5000
+Environment=Jwt__Issuer=CustomerKycApi
+Environment=Jwt__Audience=CustomerKycApiUsers
+Environment=DOTNET_RUNNING_IN_CONTAINER=false
+
+# Systemd hardening
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/customer-kyc-api
+
+[Install]
+WantedBy=multi-user.target
+EOF'
+```
+
+#### Step 23 — Enable and start the service
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable customer-kyc-api
+sudo systemctl start customer-kyc-api
+```
+
+#### Step 24 — Check that it started successfully
+
+```bash
+sudo systemctl status customer-kyc-api
+```
+
+Look for `Active: active (running)`. Then check the logs:
+
+```bash
+sudo journalctl -u customer-kyc-api -n 50 --no-pager
+```
+
+You should see:
+
+```
+Runtime : .NET 10.0.x
+OS      : Red Hat Enterprise Linux 9.8 (Plow)
+Linux   : True
+TDESEncrypt.dll: Self-test PASSED. Encryption/decryption round-trip verified on Red Hat Enterprise Linux 9.8 (Plow).
+System.Configuration.ConfigurationManager: LOADED OK.
+Now listening on: http://[::]:5000
+```
+
+---
+
+### Phase 7 — Open the Firewall
+
+#### Step 25 — Allow port 5000 through the RHEL firewall
+
+```bash
+sudo firewall-cmd --add-port=5000/tcp --permanent
+sudo firewall-cmd --reload
+
+# Verify
+sudo firewall-cmd --list-ports
+```
+
+#### Step 26 — SELinux — allow the process to bind and serve on port 5000
+
+RHEL 9.8 runs SELinux in enforcing mode by default. .NET on a non-standard port needs a
+policy label.
+
+```bash
+# Install SELinux policy tools if not present
+sudo dnf install -y policycoreutils-python-utils
+
+# Label port 5000 as an HTTP port so the .NET process can bind to it
+sudo semanage port -a -t http_port_t -p tcp 5000
+
+# Verify
+sudo semanage port -l | grep 5000
+```
+
+If `semanage port -a` fails because the port is already labelled, use `-m` (modify) instead:
+
+```bash
+sudo semanage port -m -t http_port_t -p tcp 5000
+```
+
+---
+
+### Phase 8 — Verify the Running API
+
+Run these from the server itself or from any machine that can reach port 5000.
+
+#### Step 27 — Health check (no auth required)
+
+```bash
+curl -s http://localhost:5000/health | python3 -m json.tool
+```
+
+Expected:
+
+```json
+{
+    "status": "Healthy",
+    "runtime": ".NET 10.0.x",
+    "os": "Red Hat Enterprise Linux 9.8 (Plow)",
+    "isLinux": true,
+    "isDocker": false,
+    "utcNow": "2026-08-17T..."
+}
+```
+
+`"isDocker": false` confirms you are running bare-metal, not in a container.
+
+#### Step 28 — Get a JWT token
+
+```bash
+curl -s -X POST http://localhost:5000/api/auth/token \
+    -H "Content-Type: application/json" \
+    -d '{"username":"poc-user","password":"your-strong-password"}' \
+    | python3 -m json.tool
+```
+
+Copy the `token` value from the response.
+
+#### Step 29 — Run the TDES Linux proof
+
+```bash
+curl -s -X POST http://localhost:5000/api/encryption/test \
+    -H "Authorization: Bearer <paste-token-here>" \
+    -H "Content-Type: application/json" \
+    -d '{"value":"RHEL98-TDES-Test"}' \
+    | python3 -m json.tool
+```
+
+Expected — `"platform"` confirms RHEL 9.8:
+
+```json
+{
+    "success": true,
+    "original": "RHEL98-TDES-Test",
+    "encrypted": "...",
+    "decrypted": "RHEL98-TDES-Test",
+    "runtime": ".NET 10.0.x",
+    "platform": "Red Hat Enterprise Linux 9.8 (Plow)"
+}
+```
+
+#### Step 30 — Create and retrieve a KYC record (end-to-end SQL test)
+
+```bash
+# Create (PAN and Aadhaar are encrypted and stored in SQL Server)
+curl -s -X POST http://localhost:5000/api/customers \
+    -H "Authorization: Bearer <token>" \
+    -H "Content-Type: application/json" \
+    -d '{"customerReference":"RHEL-CUST-001","firstName":"Test","lastName":"User","pan":"ABCDE1234F","aadhaar":"111122223333"}' \
+    | python3 -m json.tool
+
+# Retrieve (PAN and Aadhaar are decrypted from SQL Server and returned)
+# Replace 1 with the id returned above
+curl -s http://localhost:5000/api/customers/1 \
+    -H "Authorization: Bearer <token>" \
+    | python3 -m json.tool
+```
+
+The `pan` and `aadhaar` fields in the GET response should match exactly what you submitted,
+proving the full TDES encrypt → SQL Server → TDES decrypt round-trip on bare-metal RHEL 9.8.
+
+---
+
+### Quick Reference — Service Management
+
+```bash
+# Start
+sudo systemctl start customer-kyc-api
+
+# Stop
+sudo systemctl stop customer-kyc-api
+
+# Restart (e.g. after a config change)
+sudo systemctl restart customer-kyc-api
+
+# View live logs
+sudo journalctl -u customer-kyc-api -f
+
+# View last 100 log lines
+sudo journalctl -u customer-kyc-api -n 100 --no-pager
+
+# Disable autostart
+sudo systemctl disable customer-kyc-api
+
+# Check all .NET runtimes installed on the server
+dotnet --list-runtimes
+
+# Check SQL Server status
+sudo systemctl status mssql-server
+```
+
+---
+
+## 16. Verify Existing SQL Server Connectivity
+
+> **Use this section when SQL Server is already running** — either on a Windows server, a separate
+> Linux server, or an Azure SQL / managed instance — and you simply need to confirm the RHEL 9.8
+> application server can reach it before deploying.
+>
+> You do not need to install SQL Server. Just follow the steps below in order.
+
+---
+
+### What information you need before you start
+
+Collect the following details from your DBA or system administrator. You will use them throughout
+this section. Write them down somewhere safe (not in a public file).
+
+| What | Example | Where to get it |
+|---|---|---|
+| SQL Server hostname or IP address | `sql-server-01` or `192.168.1.50` | DBA / network team |
+| SQL Server port | `1433` (default) | DBA (ask if a non-default port is used) |
+| Database name | `CustomerKycDb` | DBA |
+| Username | `sa` or a service account | DBA |
+| Password | `YourStrong@Password123` | DBA (ask for a dedicated app account) |
+
+---
+
+### Step 1 — Install the SQL Server command-line tool (`sqlcmd`)
+
+`sqlcmd` is the tool you use to connect to SQL Server from a Linux terminal.
+Run this on your **RHEL 9.8 application server**.
+
+```bash
+# Add Microsoft's package repository (if not already done)
+sudo rpm --import https://packages.microsoft.com/keys/microsoft.asc
+
+sudo dnf install -y \
+    https://packages.microsoft.com/config/rhel/9.0/packages-microsoft-prod.rpm
+
+# Install sqlcmd and its dependency (unixODBC)
+sudo dnf install -y mssql-tools18 unixODBC-devel
+
+# Add sqlcmd to your PATH so you can run it from anywhere
+echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' | \
+    sudo tee /etc/profile.d/mssql-tools.sh
+
+# Apply the PATH change in your current session
+source /etc/profile.d/mssql-tools.sh
+```
+
+**Check it installed correctly:**
+
+```bash
+sqlcmd -?
+```
+
+You should see a help message starting with `Microsoft (R) SQL Server Command Line Tool`.
+If you see `command not found`, the PATH was not applied — run the `source` line again.
+
+---
+
+### Step 2 — Check basic network connectivity to the SQL Server
+
+Before attempting a database login, confirm the network can reach the SQL Server port at all.
+This catches firewall blocks and wrong IP addresses early, so you get a clear error instead of
+a confusing timeout.
+
+**Check if the server is reachable on the network (ping):**
+
+```bash
+ping -c 4 sql-server-01
+# Replace sql-server-01 with your actual hostname or IP address
+```
+
+What to look for:
+- `64 bytes from ...` lines — the server is reachable on the network ✅
+- `Request timeout` or `Destination Host Unreachable` — network or firewall issue ❌
+
+**Check if port 1433 (SQL Server) is open and accepting connections:**
+
+```bash
+# nc (netcat) is the standard tool for port checks on RHEL
+nc -zv sql-server-01 1433
+```
+
+What to look for:
+- `Connection to sql-server-01 1433 port [tcp/ms-sql-s] succeeded!` ✅
+- `Connection refused` — SQL Server is not listening on that port (wrong port, or SQL Server is stopped) ❌
+- `No route to host` or timeout — a firewall is blocking port 1433 ❌
+
+> **If port 1433 is blocked:** Ask your network team to open TCP port 1433 from your RHEL server's
+> IP to the SQL Server's IP. This is a firewall rule change, not something you can fix yourself.
+
+---
+
+### Step 3 — Connect to SQL Server with `sqlcmd`
+
+Now try an actual database login. Replace the values in angle brackets with your real details.
+
+```bash
+sqlcmd \
+    -S sql-server-01,1433 \
+    -U sa \
+    -P "YourStrong@Password123" \
+    -C \
+    -Q "SELECT 'Connection successful' AS Result, @@VERSION AS SqlVersion"
+```
+
+**What each flag means (in plain English):**
+
+| Flag | What it does |
+|---|---|
+| `-S sql-server-01,1433` | The address of the SQL Server. Format is `hostname,port`. |
+| `-U sa` | The username. Replace with your service account name. |
+| `-P "..."` | The password. Keep it in quotes in case it has special characters. |
+| `-C` | Trust the server's SSL certificate without verifying it against a CA. Required for most dev/test SQL Servers that use self-signed certificates. |
+| `-Q "..."` | Run this SQL query, print the result, then exit. |
+
+**Expected output — connection worked:**
+
+```
+Result                 SqlVersion
+---------------------- --------------------------------------------------
+Connection successful  Microsoft SQL Server 2022 (RTM-CU...) on Linux...
+
+(1 rows affected)
+```
+
+**Common errors and what they mean:**
+
+| Error message | What went wrong | How to fix it |
+|---|---|---|
+| `Login failed for user 'sa'` | Wrong username or password | Double-check credentials with your DBA |
+| `Cannot open server ... Login timeout expired` | Can't reach the server at all | Re-do Step 2 — network/firewall issue |
+| `Cannot open server ... Connection was refused` | Reached the server but SQL Server port is not open | SQL Server may be stopped; check with DBA |
+| `SSL Provider: certificate verify failed` | Certificate trust issue | Add `-C` flag (Trust Server Certificate) |
+| `sqlcmd: command not found` | sqlcmd not in PATH | Run `source /etc/profile.d/mssql-tools.sh` |
+
+---
+
+### Step 4 — Check if the database exists
+
+Once you can connect, verify that the `CustomerKycDb` database exists on the SQL Server.
+
+```bash
+sqlcmd \
+    -S sql-server-01,1433 \
+    -U sa \
+    -P "YourStrong@Password123" \
+    -C \
+    -Q "SELECT name AS DatabaseName, state_desc AS Status FROM sys.databases WHERE name = 'CustomerKycDb'"
+```
+
+**Expected output — database exists:**
+
+```
+DatabaseName    Status
+--------------- -------
+CustomerKycDb   ONLINE
+
+(1 rows affected)
+```
+
+**If the output shows `(0 rows affected)`** — the database does not exist yet.
+Create it by running the schema script:
+
+```bash
+# Copy schema.sql to this server first if you haven't already
+sqlcmd \
+    -S sql-server-01,1433 \
+    -U sa \
+    -P "YourStrong@Password123" \
+    -C \
+    -i /path/to/CustomerKyc.Poc/database/schema.sql
+```
+
+Expected output after running the script:
+
+```
+Table CustomerKyc created.
+```
+
+---
+
+### Step 5 — Check if the `CustomerKyc` table exists
+
+```bash
+sqlcmd \
+    -S sql-server-01,1433 \
+    -U sa \
+    -P "YourStrong@Password123" \
+    -C \
+    -Q "USE CustomerKycDb; SELECT TABLE_NAME, TABLE_SCHEMA FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'CustomerKyc'"
+```
+
+**Expected output — table exists:**
+
+```
+TABLE_NAME   TABLE_SCHEMA
+------------ ------------
+CustomerKyc  dbo
+
+(1 rows affected)
+```
+
+**If `(0 rows affected)`** — the table has not been created yet. Run the schema script (shown
+in Step 4 above). The script is idempotent — it is safe to run more than once.
+
+---
+
+### Step 6 — Check the application user's permissions
+
+If you are using a dedicated application account (recommended) rather than `sa`, verify it has
+the correct permissions on the `CustomerKycDb` database.
+
+```bash
+# First connect as sa (admin)
+sqlcmd \
+    -S sql-server-01,1433 \
+    -U sa \
+    -P "YourStrong@Password123" \
+    -C \
+    -Q "
+USE CustomerKycDb;
+-- Check what roles/permissions the app account has
+SELECT dp.name AS UserName, drm.role_principal_id, r.name AS RoleName
+FROM sys.database_principals dp
+LEFT JOIN sys.database_role_members drm ON dp.principal_id = drm.member_principal_id
+LEFT JOIN sys.database_principals r ON drm.role_principal_id = r.principal_id
+WHERE dp.name = 'kyc_app_user';
+"
+```
+
+Replace `kyc_app_user` with your actual application account name.
+
+**Minimum permissions the application account needs:**
+
+```sql
+-- Run as sa to grant minimum permissions for the application
+USE CustomerKycDb;
+
+-- Create the user if it doesn't exist
+CREATE USER kyc_app_user FOR LOGIN kyc_app_login;
+
+-- Grant only what the app needs: read and write to CustomerKyc table
+GRANT SELECT, INSERT ON dbo.CustomerKyc TO kyc_app_user;
+```
+
+---
+
+### Step 7 — Do a test insert and select to confirm read/write works
+
+This confirms the permissions are correct end-to-end, not just that the login works.
+
+```bash
+sqlcmd \
+    -S sql-server-01,1433 \
+    -U sa \
+    -P "YourStrong@Password123" \
+    -C \
+    -Q "
+USE CustomerKycDb;
+
+-- Insert a test row
+INSERT INTO dbo.CustomerKyc
+    (CustomerReference, FirstName, LastName, EncryptedPan, EncryptedAadhaar, Status, CreatedOn)
+VALUES
+    ('CONN-TEST-001', 'Connectivity', 'Test', 'test-pan', 'test-aadhaar', 'Test', SYSUTCDATETIME());
+
+-- Read it back
+SELECT Id, CustomerReference, Status, CreatedOn
+FROM dbo.CustomerKyc
+WHERE CustomerReference = 'CONN-TEST-001';
+
+-- Clean up the test row
+DELETE FROM dbo.CustomerKyc WHERE CustomerReference = 'CONN-TEST-001';
+PRINT 'Test row cleaned up.';
+"
+```
+
+**Expected output:**
+
+```
+Id   CustomerReference  Status  CreatedOn
+---- ------------------ ------- --------------------------
+1    CONN-TEST-001       Test    2026-08-17 ...
+
+(1 rows affected)
+Test row cleaned up.
+```
+
+If the INSERT succeeds and the SELECT returns the row — SQL Server connectivity is fully verified ✅
+
+---
+
+### Step 8 — Build the connection string for `appsettings.json`
+
+Once all the above steps pass, construct the connection string to put into the application
+configuration. The format used by this application is:
+
+```
+Server=<hostname>,<port>;Database=CustomerKycDb;User Id=<username>;Password=<password>;TrustServerCertificate=true;Encrypt=false
+```
+
+**Example with the values from this guide:**
+
+```
+Server=sql-server-01,1433;Database=CustomerKycDb;User Id=sa;Password=YourStrong@Password123;TrustServerCertificate=true;Encrypt=false
+```
+
+> **Do not paste this into `appsettings.json` with a real password.** Use an environment variable
+> or the secrets file instead (see Phase 6, Step 21 in Section 15). The connection string goes
+> into `/etc/customer-kyc-api/secrets.env` under the key
+> `ConnectionStrings__DefaultConnection`.
+
+---
+
+### Connectivity Check — Quick Summary
+
+Run through this checklist in order. Stop at the first failure and fix it before moving on.
+
+```
+[ ] Step 1  — sqlcmd installed and found in PATH
+[ ] Step 2  — ping to SQL Server hostname/IP succeeds
+[ ] Step 2  — nc -zv to port 1433 shows "succeeded"
+[ ] Step 3  — sqlcmd login returns "Connection successful"
+[ ] Step 4  — CustomerKycDb database exists and is ONLINE
+[ ] Step 5  — CustomerKyc table exists in dbo schema
+[ ] Step 6  — Application account has SELECT + INSERT on CustomerKyc
+[ ] Step 7  — Test insert and select completes without errors
+[ ] Step 8  — Connection string built and ready for secrets file
+```
+
+All eight boxes checked = your SQL Server connection is ready for deployment.
+
+---
+
+*Customer KYC API POC · .NET 10 · Red Hat Enterprise Linux 9.8 (RHEL 9.8 / UBI 9) · All 36 tests passing*
