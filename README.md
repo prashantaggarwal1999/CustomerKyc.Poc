@@ -31,6 +31,7 @@
 14. [GitHub Actions CI/CD](#14-github-actions-cicd)
 15. [Manual Deployment on RHEL 9.8 Without Docker](#15-manual-deployment-on-rhel-98-without-docker)
 16. [Verify Existing SQL Server Connectivity](#16-verify-existing-sql-server-connectivity)
+17. [Deploy from Windows to RHEL 9.8 — Publish Locally and Copy Manually](#17-deploy-from-windows-to-rhel-98--publish-locally-and-copy-manually)
 
 ---
 
@@ -1769,6 +1770,550 @@ Run through this checklist in order. Stop at the first failure and fix it before
 ```
 
 All eight boxes checked = your SQL Server connection is ready for deployment.
+
+---
+
+## 17. Deploy from Windows to RHEL 9.8 — Publish Locally and Copy Manually
+
+> **This is the recommended workflow for the current phase.**
+> You build and publish the application on your local Windows development machine, then copy
+> the output files to the RHEL 9.8 server. The server only needs the .NET runtime — not the
+> SDK, not Docker, not any build tools.
+>
+> **Who does what:**
+> - **Developer (Windows machine):** runs Steps 1–5
+> - **Someone with SSH access to the RHEL server:** runs Steps 6–16
+
+---
+
+### What you need before you start
+
+| Item | Where to get it |
+|---|---|
+| .NET 10 SDK installed on your Windows machine | https://dot.net — download the SDK installer |
+| IP address or hostname of the RHEL 9.8 server | Ask your system administrator |
+| SSH username and password for the RHEL server | Ask your system administrator |
+| SQL Server hostname, port, database name, username, password | Follow Section 16 first to verify connectivity |
+| WinSCP installed (for copying files) | https://winscp.net — free download |
+
+---
+
+### Part A — On Your Windows Machine (Build and Publish)
+
+#### Step 1 — Open PowerShell and go to the project folder
+
+Press `Win + X` and click **Terminal** or **PowerShell**. Then type:
+
+```powershell
+cd D:\POC\CustomerKyc.Poc
+```
+
+> If your project is in a different location, change the path accordingly.
+> You can verify you are in the right folder by running `dir` — you should see `Dockerfile`,
+> `docker-compose.yml`, and `src` listed.
+
+#### Step 2 — Run the tests first
+
+**Always run tests before publishing.** This confirms everything works correctly on your machine
+before you put anything on the server.
+
+```powershell
+dotnet test tests\CustomerKyc.Api.Tests\ --configuration Release
+```
+
+Wait for it to finish. You must see this before continuing:
+
+```
+Passed! - Failed: 0, Passed: 36, Skipped: 0, Total: 36
+```
+
+If any tests fail, do not continue — fix the failure first.
+
+#### Step 3 — Publish the application targeting Linux
+
+This command compiles the application and packages it into a folder of files ready to run on
+a Linux server.
+
+```powershell
+dotnet publish src\CustomerKyc.Api\CustomerKyc.Api.csproj `
+    --configuration Release `
+    --runtime linux-x64 `
+    --self-contained false `
+    --output D:\POC\CustomerKyc.Poc\publish-linux
+```
+
+**What each flag does:**
+
+| Flag | Plain English meaning |
+|---|---|
+| `--configuration Release` | Build in Release mode (optimised, not debug) |
+| `--runtime linux-x64` | Package for 64-bit Linux — this is what the RHEL server runs |
+| `--self-contained false` | Do not bundle the .NET runtime — the server will have it already |
+| `--output ...publish-linux` | Put all the output files in this folder |
+
+Wait for the command to finish. You will see: `Build succeeded.`
+
+#### Step 4 — Verify the output folder contains TDESEncrypt.dll
+
+Open File Explorer and navigate to `D:\POC\CustomerKyc.Poc\publish-linux`.
+
+Or run this in PowerShell:
+
+```powershell
+dir D:\POC\CustomerKyc.Poc\publish-linux | Select-Object Name
+```
+
+You must see `TDESEncrypt.dll` in the list. This is the DLL whose Linux compatibility we are
+proving. If it is missing, the publish step had an error — do not copy the files until this
+file is present.
+
+You should also see:
+- `CustomerKyc.Api.dll` — the main application
+- `appsettings.json` — the base configuration file
+- Several other `.dll` files — library dependencies
+
+#### Step 5 — Note the folder size
+
+```powershell
+(Get-ChildItem D:\POC\CustomerKyc.Poc\publish-linux -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB
+```
+
+This prints the total size in MB. It is typically around 10–20 MB, which is small enough to
+copy over SSH without any issues.
+
+---
+
+### Part B — Copy the Files to the RHEL Server
+
+You have two options. **Option A (WinSCP)** is easier if you are not familiar with the command
+line. **Option B (SCP)** is faster if you are comfortable with a terminal.
+
+---
+
+#### Option A — Copy using WinSCP (GUI, recommended for beginners)
+
+WinSCP is a free Windows application that lets you copy files to a Linux server using a
+drag-and-drop interface, similar to Windows Explorer.
+
+**A1 — Download and install WinSCP**
+
+Go to https://winscp.net and click **Download WinSCP**. Run the installer with default options.
+
+**A2 — Open WinSCP and create a new connection**
+
+1. Open WinSCP
+2. A login dialog appears automatically
+3. Fill in the fields:
+
+| Field | Value |
+|---|---|
+| File protocol | `SFTP` |
+| Host name | The IP address or hostname of your RHEL server, e.g. `192.168.1.100` |
+| Port number | `22` (SSH default — do not change unless told otherwise) |
+| User name | Your SSH username on the RHEL server |
+| Password | Your SSH password |
+
+4. Click **Login**
+5. If a warning appears saying "The server's host key is not cached" — click **Accept**.
+   This is normal the first time you connect to a server.
+
+**A3 — Navigate to the target folder on the server**
+
+In the right panel (the server side), navigate to `/opt/customer-kyc-api`.
+
+If the folder does not exist yet, right-click in the right panel and choose
+**New → Directory**, then type `customer-kyc-api`.
+
+**A4 — Copy the files**
+
+1. In the left panel (your Windows machine), navigate to
+   `D:\POC\CustomerKyc.Poc\publish-linux`
+2. Press `Ctrl + A` to select all files
+3. Drag them to the right panel (the server side)
+4. A confirmation dialog appears — click **Copy**
+5. Wait for the transfer to finish (the progress bar will reach 100%)
+
+**A5 — Verify the files are on the server**
+
+In the right panel (server side), you should now see `CustomerKyc.Api.dll`, `TDESEncrypt.dll`,
+and all the other files listed. If you can see them, the copy was successful.
+
+---
+
+#### Option B — Copy using SCP from Git Bash or PowerShell
+
+If you have **Git for Windows** installed, you already have `scp` available in Git Bash.
+
+**Open Git Bash** (right-click on the Desktop or any folder → **Git Bash Here**) and run:
+
+```bash
+scp -r /d/POC/CustomerKyc.Poc/publish-linux/* \
+    youruser@192.168.1.100:/opt/customer-kyc-api/
+```
+
+Replace:
+- `youruser` with your SSH username
+- `192.168.1.100` with the server IP or hostname
+- The path `/d/POC/CustomerKyc.Poc/publish-linux/*` means `D:\POC\CustomerKyc.Poc\publish-linux\*`
+  (Git Bash uses forward slashes and `/d/` instead of `D:\`)
+
+You will be asked for your password. Type it and press Enter (nothing appears on screen while
+typing — this is normal).
+
+The files will transfer. When the command prompt returns, the copy is done.
+
+---
+
+### Part C — On the RHEL 9.8 Server (Setup and Run)
+
+Log in to the RHEL 9.8 server via SSH. On Windows, open **PowerShell** and run:
+
+```powershell
+ssh youruser@192.168.1.100
+```
+
+Type your password when prompted. You are now on the Linux server.
+
+#### Step 6 — Install the .NET ASP.NET Core Runtime
+
+The server needs the .NET runtime to run the application. It does **not** need the full SDK
+(the SDK is only needed for building, which you already did on Windows).
+
+```bash
+# Add Microsoft's package repository for RHEL 9
+sudo rpm --import https://packages.microsoft.com/keys/microsoft.asc
+
+sudo dnf install -y \
+    https://packages.microsoft.com/config/rhel/9.0/packages-microsoft-prod.rpm
+
+# Install the ASP.NET Core runtime (not the SDK)
+sudo dnf install -y aspnetcore-runtime-10.0
+```
+
+This will take 1–2 minutes to download and install.
+
+**Verify it installed correctly:**
+
+```bash
+dotnet --list-runtimes
+```
+
+You should see a line like:
+
+```
+Microsoft.AspNetCore.App 10.0.x [/usr/lib/dotnet/shared/Microsoft.AspNetCore.App]
+```
+
+#### Step 7 — Create the application folder and a service user
+
+Create a dedicated system account for running the application. This is a security best practice
+— the application will not run as root.
+
+```bash
+# Create the service account (a locked-down system user with no home directory or login shell)
+sudo useradd --system --uid 1654 --gid 0 --no-create-home --shell /sbin/nologin kyc-api
+
+# Create the folder where the application files will live
+sudo mkdir -p /opt/customer-kyc-api
+
+# Give ownership of that folder to the kyc-api service account
+sudo chown kyc-api:root /opt/customer-kyc-api
+sudo chmod 750 /opt/customer-kyc-api
+```
+
+> **Why a separate user?** If the application is ever compromised, the attacker can only do
+> what the `kyc-api` user is allowed to do — which is very limited. Running as root would give
+> them full control of the server.
+
+#### Step 8 — Fix ownership of the copied files
+
+After copying the files in Part B, set the correct owner so the service account can read them:
+
+```bash
+sudo chown -R kyc-api:root /opt/customer-kyc-api
+sudo chmod -R 750 /opt/customer-kyc-api
+```
+
+**Verify the files are there:**
+
+```bash
+ls /opt/customer-kyc-api
+```
+
+You should see `CustomerKyc.Api.dll`, `TDESEncrypt.dll`, `appsettings.json`, and others.
+If the folder is empty, go back to Part B and copy the files again.
+
+#### Step 9 — Apply the database schema
+
+Run the schema script against your SQL Server. Replace the values with your actual SQL Server
+details. (If you already did this in Section 16, skip this step.)
+
+```bash
+# Install sqlcmd if not already installed
+sudo dnf install -y mssql-tools18 unixODBC-devel
+echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' | sudo tee /etc/profile.d/mssql-tools.sh
+source /etc/profile.d/mssql-tools.sh
+
+# Run the schema script
+# The schema.sql file is inside your publish output
+sqlcmd \
+    -S YOUR-SQL-SERVER-IP,1433 \
+    -U sa \
+    -P "YourStrong@Password123" \
+    -C \
+    -i /opt/customer-kyc-api/../../database/schema.sql
+```
+
+> **Tip:** If the schema.sql file is not available on the server, copy it from your Windows
+> machine the same way you copied the publish output — just drag it to the server using WinSCP,
+> or use `scp database/schema.sql youruser@server:/tmp/schema.sql` and then run sqlcmd against
+> `/tmp/schema.sql`.
+
+#### Step 10 — Create the secrets configuration file
+
+The application needs passwords and secret keys to start. Store them in a file that only root
+can read — never put real passwords directly in the service configuration.
+
+```bash
+# Create a private directory for secrets
+sudo mkdir -p /etc/customer-kyc-api
+
+# Write the secrets file
+sudo bash -c 'cat > /etc/customer-kyc-api/secrets.env << EOF
+Jwt__Secret=replace-this-with-a-random-string-at-least-32-characters-long!!
+Encryption__Key=replace-this-with-your-encryption-key-32-chars!!
+Auth__Username=poc-user
+Auth__Password=replace-with-a-strong-password
+ConnectionStrings__DefaultConnection=Server=YOUR-SQL-SERVER-IP,1433;Database=CustomerKycDb;User Id=sa;Password=YourStrong@Password123;TrustServerCertificate=true;Encrypt=false
+EOF'
+
+# Lock down the file — only root can read it
+sudo chmod 600 /etc/customer-kyc-api/secrets.env
+sudo chown root:root /etc/customer-kyc-api/secrets.env
+```
+
+> **Important:** Replace every `replace-this-...` placeholder with real values.
+> The `Encryption__Key` must never change once you have data in the database —
+> changing it makes all stored PAN and Aadhaar values permanently unreadable.
+
+**Verify the file looks correct:**
+
+```bash
+sudo cat /etc/customer-kyc-api/secrets.env
+```
+
+All five lines should be present with real values (not the placeholder text).
+
+#### Step 11 — Create the systemd service file
+
+Systemd is the process manager on RHEL. It will start your application automatically when the
+server boots, and restart it if it crashes.
+
+```bash
+sudo bash -c 'cat > /etc/systemd/system/customer-kyc-api.service << EOF
+[Unit]
+Description=Customer KYC API (.NET 10 on RHEL 9.8)
+After=network.target
+
+[Service]
+Type=notify
+User=kyc-api
+WorkingDirectory=/opt/customer-kyc-api
+ExecStart=/usr/bin/dotnet /opt/customer-kyc-api/CustomerKyc.Api.dll
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+SyslogIdentifier=customer-kyc-api
+
+EnvironmentFile=/etc/customer-kyc-api/secrets.env
+Environment=ASPNETCORE_ENVIRONMENT=Production
+Environment=ASPNETCORE_URLS=http://+:5000
+Environment=Jwt__Issuer=CustomerKycApi
+Environment=Jwt__Audience=CustomerKycApiUsers
+
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/customer-kyc-api
+
+[Install]
+WantedBy=multi-user.target
+EOF'
+```
+
+#### Step 12 — Start the application
+
+```bash
+# Tell systemd about the new service file
+sudo systemctl daemon-reload
+
+# Set it to start automatically on server reboot
+sudo systemctl enable customer-kyc-api
+
+# Start it now
+sudo systemctl start customer-kyc-api
+```
+
+#### Step 13 — Check the application started correctly
+
+```bash
+sudo systemctl status customer-kyc-api
+```
+
+Look for this line:
+
+```
+Active: active (running) since ...
+```
+
+If you see `failed` instead, check the logs in Step 14.
+
+#### Step 14 — Read the startup logs
+
+```bash
+sudo journalctl -u customer-kyc-api -n 60 --no-pager
+```
+
+You must see these lines — they confirm .NET is running on RHEL 9.8 and TDESEncrypt.dll
+passed its self-test:
+
+```
+OS      : Red Hat Enterprise Linux 9.8 (Plow)
+Linux   : True
+TDESEncrypt.dll: Self-test PASSED. Encryption/decryption round-trip verified on Red Hat Enterprise Linux 9.8 (Plow).
+Now listening on: http://[::]:5000
+```
+
+If you see an error about a missing connection string or secret key, open
+`/etc/customer-kyc-api/secrets.env`, fix the value, then run:
+
+```bash
+sudo systemctl restart customer-kyc-api
+```
+
+#### Step 15 — Open the firewall port
+
+By default RHEL blocks all incoming ports. Allow port 5000 so the API is reachable.
+
+```bash
+sudo firewall-cmd --add-port=5000/tcp --permanent
+sudo firewall-cmd --reload
+```
+
+**Confirm the port is open:**
+
+```bash
+sudo firewall-cmd --list-ports
+# Should include: 5000/tcp
+```
+
+#### Step 16 — Verify the application is working
+
+Run these commands from the server itself to confirm everything is working end to end.
+
+**Health check — confirms the app is running on RHEL 9.8:**
+
+```bash
+curl -s http://localhost:5000/health
+```
+
+Expected response:
+
+```json
+{
+  "status": "Healthy",
+  "runtime": ".NET 10.0.x",
+  "os": "Red Hat Enterprise Linux 9.8 (Plow)",
+  "isLinux": true,
+  "isDocker": false
+}
+```
+
+`"isDocker": false` confirms this is a direct deployment, not a container.
+
+**Get a JWT token:**
+
+```bash
+curl -s -X POST http://localhost:5000/api/auth/token \
+    -H "Content-Type: application/json" \
+    -d '{"username":"poc-user","password":"replace-with-a-strong-password"}'
+```
+
+Copy the `token` value from the response.
+
+**Run the TDES proof — confirms TDESEncrypt.dll works on RHEL 9.8:**
+
+```bash
+curl -s -X POST http://localhost:5000/api/encryption/test \
+    -H "Authorization: Bearer PASTE-TOKEN-HERE" \
+    -H "Content-Type: application/json" \
+    -d '{"value":"RHEL98-Manual-Deploy-Test"}'
+```
+
+Expected — `"success": true` and platform showing RHEL 9.8:
+
+```json
+{
+  "success": true,
+  "original": "RHEL98-Manual-Deploy-Test",
+  "encrypted": "...",
+  "decrypted": "RHEL98-Manual-Deploy-Test",
+  "platform": "Red Hat Enterprise Linux 9.8 (Plow)"
+}
+```
+
+If you see this, the deployment is complete and verified ✅
+
+---
+
+### How to deploy an updated version
+
+When you make code changes and need to redeploy, repeat only these steps:
+
+```
+On Windows:
+  Step 2  — Re-run the tests
+  Step 3  — Re-publish (output goes to the same publish-linux folder, overwriting old files)
+  Step 4  — Check TDESEncrypt.dll is still in the output
+
+Copy to server:
+  Option A or B — Copy the new files to /opt/customer-kyc-api (overwrite existing)
+
+On RHEL server:
+  sudo systemctl restart customer-kyc-api
+  sudo journalctl -u customer-kyc-api -n 30 --no-pager   ← check logs after restart
+```
+
+---
+
+### Deployment Checklist
+
+Print this out or tick it off before telling anyone the deployment is done.
+
+```
+Part A — Windows (build machine)
+  [ ] Tests ran and all 36 passed
+  [ ] dotnet publish completed with "Build succeeded"
+  [ ] TDESEncrypt.dll is present in publish-linux folder
+
+Part B — File copy
+  [ ] All files copied to /opt/customer-kyc-api on the RHEL server
+  [ ] File count on server matches file count in publish-linux folder
+
+Part C — RHEL server setup
+  [ ] .NET runtime installed — dotnet --list-runtimes shows 10.0.x
+  [ ] kyc-api service user created
+  [ ] /opt/customer-kyc-api is owned by kyc-api
+  [ ] Database schema applied — CustomerKyc table exists
+  [ ] /etc/customer-kyc-api/secrets.env created with real values (no placeholders)
+  [ ] systemd service enabled and started
+  [ ] systemctl status shows: active (running)
+  [ ] Logs show: TDESEncrypt.dll: Self-test PASSED on Red Hat Enterprise Linux 9.8
+  [ ] Logs show: Now listening on: http://[::]:5000
+  [ ] Firewall port 5000 opened
+  [ ] GET /health returns "status": "Healthy" and "os": "Red Hat Enterprise Linux 9.8"
+  [ ] POST /api/encryption/test returns "success": true
+```
 
 ---
 
